@@ -85,6 +85,7 @@
 #include "strata/program/prefill_plan.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
+#include "strata/program/snapshot_workers.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -9467,6 +9468,35 @@ int main(int argc, char** argv) {
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
+        std::unique_ptr<strata::program::SnapshotWorkers> snapshot_workers;
+        if (const char* v = std::getenv("STRATA_SNAPSHOT_PARALLEL"); v && v[0] == '1' && !stages.empty()) {
+            const char* cpu_spec = std::getenv("STRATA_SNAPSHOT_COPY_CPU");
+            int first_cpu = 0;
+            if (cpu_spec && !strata::program::parse_snapshot_copy_cpu(cpu_spec, stages.size(), first_cpu)) {
+                std::printf("ERR STRATA_SNAPSHOT_COPY_CPU: expected a nonnegative CPU with room for every worker\n");
+                return 1;
+            }
+            try {
+                snapshot_workers = std::make_unique<strata::program::SnapshotWorkers>(stages.size() + 1);
+                snapshot_workers->run([&](size_t index) {
+                    if (index == 0) return;  // the host keeps its placement
+                    strata::platform::name_this_thread("strata-snapshot");
+                    if (cpu_spec) {
+                        const int cpu = first_cpu + int(index - 1);
+                        if (!strata::kernels::cpu::pin_current_thread(cpu).valid)
+                            throw std::runtime_error("cannot pin snapshot copy worker to CPU " + std::to_string(cpu));
+                        strata::aux_cpus::note_owned_thread();
+                        std::fprintf(stderr, "strata serve: snapshot copy worker %zu on CPU %d\n", index - 1, cpu);
+                    } else {
+                        strata::aux_cpus::pin_current_thread();
+                    }
+                });
+            } catch (const std::exception& e) {
+                std::printf("ERR starting snapshot workers: %s\n", e.what());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: parallel snapshot stages on (%zu devices)\n", stages.size() + 1);
+        }
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
@@ -9599,18 +9629,43 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                        std::move(reuse), &reused_bytes)) return false;
-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
-                    auto& st = stages[k];
-                    const strata::core::OnDevice on(st->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
-                    strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
-                        return false;
-                    image.stage_images.push_back(std::move(part));
+                if (snapshot_workers) {
+                    std::vector<strata::core::SavedConversation> parts(n_st + 1);
+                    std::vector<size_t> reused(n_st + 1, 0);
+                    std::vector<std::string> errors(n_st + 1);
+                    std::vector<int> ok(n_st + 1, 0);
+                    snapshot_workers->run([&](size_t index) {
+                        const int dev = index == 0 ? 0 : stages[index - 1]->dev;
+                        const strata::core::OnDevice on(dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { errors[index] = "stage sync failed"; return; }
+                        auto& session = index == 0 ? ss : stages[index - 1]->ss;
+                        const strata::core::ConversationView stage_view{live, live_imgs,
+                            index == 0 ? cs.stage0 : cs.parts[index - 1], cvec_cached};
+                        ok[index] = strata::core::conversation_snapshot_save(parts[index], stage_view, session, g,
+                            index == 0 ? draft0 : draft_of(index - 1), errors[index],
+                            index == 0 ? std::move(reuse) : std::move(stage_reuse[index - 1]), &reused[index]);
+                    });
+                    for (size_t index = 0; index < parts.size(); ++index) {
+                        if (!ok[index]) { err = errors[index]; return false; }
+                        reused_bytes += reused[index];
+                    }
+                    image = std::move(parts[0]);
+                    for (size_t index = 1; index < parts.size(); ++index)
+                        image.stage_images.push_back(std::move(parts[index]));
+                } else {
+                    if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                            std::move(reuse), &reused_bytes)) return false;
+                    for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                        const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                        strata::core::SavedConversation part;
+                        if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                                std::move(stage_reuse[k]), &reused_bytes))
+                            return false;
+                        image.stage_images.push_back(std::move(part));
+                    }
                 }
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
@@ -12861,24 +12916,47 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
-                    strata::core::ConversationRestore::restored) {
-                    // Already prevalidated above: a failure here is fatal, never
-                    // permission to decode from a partially restored session.
-                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
-                    return 1;
-                }
-                for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
-                    const strata::core::OnDevice on(stages[i]->dev);
-                    if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
-                        strata::core::ConversationRestore::restored) {
-                        std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
-                                    err.c_str());
+                if (snapshot_workers) {
+                    std::vector<std::string> errors(stages.size() + 1);
+                    std::vector<int> ok(stages.size() + 1, 0);
+                    snapshot_workers->run([&](size_t index) {
+                        const int dev = index == 0 ? 0 : stages[index - 1]->dev;
+                        const strata::core::OnDevice on(dev);
+                        auto& session = index == 0 ? ss : stages[index - 1]->ss;
+                        const auto& part = index == 0 ? *incoming : incoming->stage_images[index - 1];
+                        const auto* draft = use_mtp && (mtp_first ? index == 0 : index == stages.size())
+                            ? &mtp.kv_state() : nullptr;
+                        ok[index] = strata::core::conversation_snapshot_restore(part, session, g, draft, errors[index])
+                            == strata::core::ConversationRestore::restored;
+                        if (ok[index] && cudaDeviceSynchronize() != cudaSuccess) {
+                            errors[index] = "stage sync failed";
+                            ok[index] = 0;
+                        }
+                    });
+                    for (size_t index = 0; index < ok.size(); ++index) if (!ok[index]) {
+                        std::printf("ERR restoring parked conversation (parallel stage %zu): %s\n", index, errors[index].c_str());
                         return 1;
                     }
-                    if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
+                } else {
+                    if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
+                            use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
+                        strata::core::ConversationRestore::restored) {
+                        // Already prevalidated above: a failure here is fatal, never
+                        // permission to decode from a partially restored session.
+                        std::printf("ERR restoring parked conversation: %s\n", err.c_str());
+                        return 1;
+                    }
+                    for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
+                        const strata::core::OnDevice on(stages[i]->dev);
+                        if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
+                                use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            strata::core::ConversationRestore::restored) {
+                            std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
+                                        err.c_str());
+                            return 1;
+                        }
+                        if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
+                    }
                 }
                 if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;

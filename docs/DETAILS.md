@@ -1192,6 +1192,17 @@ INT8, Q4_0 and identity-layout K8V4 snapshots are supported; the K8V4 draft ring
 remains INT8, as in upstream. Windows/HIP and multi-GPU runtime coverage must be
 reported separately from Linux/CUDA evidence.
 
+**Parallel layer-split snapshots (opt-in).** `STRATA_SNAPSHOT_PARALLEL=1` captures and restores the stages of a parked
+conversation concurrently, using persistent workers on their own GPUs. It applies to splits across two or more cards.
+Every job finishes before an image is published or decoding resumes. Incoming images keep their validation before
+the outgoing state is overwritten, and a restore failure still stops the engine. Without this variable, stages copy
+serially as before.
+
+Copy workers use `--aux-cpus` when configured, otherwise they inherit the host thread's affinity.
+`STRATA_SNAPSHOT_COPY_CPU=N` overrides this with logical CPU N for the first worker and consecutive CPUs for the rest;
+choose spare CPUs for the machine. The value must be a nonnegative integer. Invalid values and CPUs that cannot be
+assigned stop startup with an error. The host and expert workers keep their placement.
+
 The web page's Monitor tab has a **Conversation cache** card (0.1.39, #596): the parked conversations against the
 slots and the RAM budget, how many were parked, restored and evicted, and the last switch (read from the engine's
 log), and for every setup how many prompt tokens the cache gave back - in the last request and since the start.
